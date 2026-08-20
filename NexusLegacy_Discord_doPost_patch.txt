@@ -1,0 +1,25 @@
+在既有 FishSnack Apps Script 的 Code.gs 中找到 doPost(e)。
+
+JSON.parse 完成後、原本「LINE Webhook events」判斷之前，加入以下四行：
+
+  if (payload && payload.kind === 'nexus_legacy_verified_notification') {
+    return handleNexusLegacyNotification_(payload);
+  }
+
+插入後的前後文應該如下：
+
+  try {
+    payload = JSON.parse(raw || '{}');
+  } catch (err) {
+    safeWriteLog_('error', 'post', 'JSON 解析失敗', String(err));
+    return json_({ ok: false, error: 'bad_json', version: APP_VERSION });
+  }
+
+  if (payload && payload.kind === 'nexus_legacy_verified_notification') {
+    return handleNexusLegacyNotification_(payload);
+  }
+
+  // v1.0.1：LINE Webhook 驗證通常會送 events: []。
+  if (payload && Array.isArray(payload.events)) {
+
+不要新增第二個 doPost(e)，否則 Apps Script 會有同名函式衝突。
