@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nexus Legacy 精準 Discord 完成通知
 // @namespace    https://nl.luulyuan.cc/
-// @version      2.7.0
+// @version      2.7.1
 // @description  追蹤艦隊、建築、研究與船艦製造完成時間，顯示海盜情報，並可切換自動偵查礦氫資源或海盜星系。
 // @updateURL    https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
@@ -20,7 +20,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Nexus Legacy 精準 Discord 完成通知';
-  const SCRIPT_VERSION = '2.7.0';
+  const SCRIPT_VERSION = '2.7.1';
   const DEFAULT_GAS_URL = '';
   const AUTH_STORAGE_KEY = 'galaxytest-auth';
   const ACTIVE_SYNC_MS = 30_000;
@@ -37,11 +37,7 @@
     sent: 'nexus_line_sent_v1',
     // 使用新鍵，避免舊版礦氣偵查曾經啟用時，升級後立刻自行派船。
     autoScoutEnabled: 'nexus_auto_system_survey_enabled_v1',
-    autoScoutMode: 'nexus_auto_scout_mode_v1',
-    autoScoutThreshold: 'nexus_auto_resource_threshold_v1',
-    autoScoutProcessedReports: 'nexus_auto_resource_processed_reports_v1',
-    autoScoutManagedNotes: 'nexus_auto_resource_managed_notes_v1',
-    autoScoutReportBaselineReady: 'nexus_auto_resource_report_baseline_ready_v1'
+    autoScoutMode: 'nexus_auto_scout_mode_v1'
   };
 
   const runtime = {
@@ -75,17 +71,10 @@
     pirateNavigationSignature: '',
     autoScoutEnabled: Boolean(GM_getValue(STORAGE.autoScoutEnabled, false)),
     autoScoutMode: normalizedAutoScoutMode(GM_getValue(STORAGE.autoScoutMode, 'pirate')),
-    autoScoutThreshold: normalizedAutoScoutThreshold(
-      GM_getValue(STORAGE.autoScoutThreshold, 1.8)
-    ),
-    autoScoutProcessedReports: loadMap(STORAGE.autoScoutProcessedReports),
-    autoScoutManagedNotes: loadMap(STORAGE.autoScoutManagedNotes),
     autoScoutPanel: null,
     autoScoutStatusNode: null,
     autoScoutToggleButton: null,
     autoScoutModeSelect: null,
-    autoScoutThresholdInput: null,
-    autoScoutReportButton: null,
     autoScoutTimer: 0,
     autoScoutPromise: null,
     autoScoutPreviewTargets: [],
@@ -98,7 +87,6 @@
       freeFleetSlots: 0,
       activeFieldScans: 0,
       readyFields: 0,
-      unreadReports: 0,
       activeSurveys: 0,
       readySystems: 0,
       coolingSystems: 0,
@@ -2415,28 +2403,12 @@
     }
   }
 
-  function normalizedAutoScoutThreshold(value) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return 1.8;
-    return Math.min(9.99, Math.max(0.1, Math.round(number * 100) / 100));
-  }
-
   function normalizedAutoScoutMode(value) {
     return String(value || '') === 'resource' ? 'resource' : 'pirate';
   }
 
   function autoScoutModeLabel(mode = runtime.autoScoutMode) {
     return normalizedAutoScoutMode(mode) === 'resource' ? '礦＋氫偵查' : '海盜偵查';
-  }
-
-  function autoScoutReportRows(data) {
-    return apiArray(data, 'reports').filter((report) =>
-      report && report.reportType === 'field_scan' && report.details
-    );
-  }
-
-  function autoScoutMapNoteRows(data) {
-    return apiArray(data, 'notes').filter((note) => note && note.systemId != null);
   }
 
   function autoScoutCatalogRows(data) {
@@ -2459,207 +2431,12 @@
   function saveAutoScoutState() {
     GM_setValue(STORAGE.autoScoutEnabled, Boolean(runtime.autoScoutEnabled));
     GM_setValue(STORAGE.autoScoutMode, normalizedAutoScoutMode(runtime.autoScoutMode));
-    GM_setValue(
-      STORAGE.autoScoutThreshold,
-      normalizedAutoScoutThreshold(runtime.autoScoutThreshold)
-    );
-    saveMap(STORAGE.autoScoutProcessedReports, runtime.autoScoutProcessedReports);
-    saveMap(STORAGE.autoScoutManagedNotes, runtime.autoScoutManagedNotes);
-  }
-
-  function pruneAutoScoutProcessedReports() {
-    const entries = Object.entries(runtime.autoScoutProcessedReports)
-      .sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0));
-    runtime.autoScoutProcessedReports = Object.fromEntries(entries.slice(0, 500));
-  }
-
-  function autoScoutFormatRichness(value) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return '';
-    return String(Number(number.toFixed(2)));
   }
 
   function autoScoutResourceLabel(fieldType) {
     if (fieldType === 'ore') return '礦';
     if (fieldType === 'gas') return '氣';
     return '';
-  }
-
-  function autoScoutStripResourceTokens(value) {
-    return String(value || '')
-      .replace(/\d+(?:\.\d+)?\s*(?:礦|矿|氣|气)/gi, ' ')
-      .replace(/\s*[+｜|、,，]\s*(?=$|[+｜|、,，])/g, ' ')
-      .replace(/^[\s+｜|、,，]+|[\s+｜|、,，]+$/g, '')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-  }
-
-  function autoScoutMergedNoteText(currentText, resourceTokens) {
-    const manualText = autoScoutStripResourceTokens(currentText);
-    return [resourceTokens.join('+'), manualText].filter(Boolean).join(' ').trim();
-  }
-
-  function autoScoutLatestReportsBySystem(reports) {
-    const bySystem = new Map();
-    const ordered = [...reports].sort(
-      (left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0)
-    );
-    for (const report of ordered) {
-      const details = report && report.details || {};
-      const systemId = Number(details.systemId ?? report.systemId);
-      const fieldType = String(details.fieldType || '');
-      if (!Number.isFinite(systemId) || !['ore', 'gas'].includes(fieldType)) continue;
-      let value = bySystem.get(systemId);
-      if (!value) {
-        value = new Map();
-        bySystem.set(systemId, value);
-      }
-      if (!value.has(fieldType)) value.set(fieldType, report);
-    }
-    return bySystem;
-  }
-
-  function autoScoutTokensForSystem(reportMap) {
-    const threshold = normalizedAutoScoutThreshold(runtime.autoScoutThreshold);
-    const tokens = [];
-    for (const fieldType of ['ore', 'gas']) {
-      const report = reportMap && reportMap.get(fieldType);
-      const richness = Number(report && report.details && report.details.richness);
-      if (!Number.isFinite(richness) || richness < threshold) continue;
-      const formatted = autoScoutFormatRichness(richness);
-      const label = autoScoutResourceLabel(fieldType);
-      if (formatted && label) tokens.push(formatted + label);
-    }
-    return tokens;
-  }
-
-  async function syncAutoScoutFavorite(systemId, resourceTokens, notes) {
-    if (!resourceTokens.length) return { changed: false, skipped: true };
-
-    const managed = runtime.autoScoutManagedNotes[String(systemId)] || null;
-    const existing = notes.find((note) =>
-      Number(note.systemId) === Number(systemId) &&
-      (
-        managed && Number(note.id) === Number(managed.noteId) ||
-        !managed && note.fieldId == null
-      )
-    ) || notes.find((note) =>
-      Number(note.systemId) === Number(systemId) && note.fieldId == null
-    );
-    const currentText = String(existing && existing.text || '');
-    const nextText = autoScoutMergedNoteText(currentText, resourceTokens);
-    if (!nextText) return { changed: false, skipped: true };
-
-    if (existing) {
-      if (nextText !== currentText || String(existing.color || '') !== 'yellow') {
-        await apiJsonRequest(
-          '/api/command-center/map-notes/' + encodeURIComponent(existing.id),
-          {
-            method: 'PATCH',
-            body: { text: nextText, color: 'yellow' }
-          }
-        );
-        existing.text = nextText;
-        existing.color = 'yellow';
-      }
-      runtime.autoScoutManagedNotes[String(systemId)] = {
-        noteId: existing.id,
-        createdByAuto: Boolean(managed && managed.createdByAuto),
-        updatedAt: Date.now()
-      };
-      return { changed: nextText !== currentText, text: nextText };
-    }
-
-    const created = await apiJsonRequest('/api/command-center/map-notes', {
-      method: 'POST',
-      body: {
-        systemId: Number(systemId),
-        text: nextText,
-        color: 'yellow',
-        fieldId: null
-      }
-    });
-    const note = created && (created.note || created.mapNote || created);
-    const noteId = note && note.id;
-    if (noteId == null) {
-      throw new Error('收藏已送出，但伺服器未回傳收藏編號');
-    }
-    notes.push(note);
-    runtime.autoScoutManagedNotes[String(systemId)] = {
-      noteId,
-      createdByAuto: true,
-      updatedAt: Date.now()
-    };
-    return { changed: true, text: nextText };
-  }
-
-  async function markAutoScoutReportsRead(reports) {
-    const unread = reports.filter((report) => report && report.id != null && !report.isRead);
-    let markedRead = 0;
-    const batchSize = 6;
-    for (let offset = 0; offset < unread.length; offset += batchSize) {
-      const batch = unread.slice(offset, offset + batchSize);
-      const results = await Promise.allSettled(batch.map((report) =>
-        apiJsonRequest(
-          '/api/fleet/field-scan-reports/' + encodeURIComponent(report.id) + '/read',
-          { method: 'POST' }
-        )
-      ));
-      for (let index = 0; index < results.length; index += 1) {
-        if (results[index].status !== 'fulfilled') continue;
-        batch[index].isRead = true;
-        markedRead += 1;
-      }
-    }
-    runtime.autoScoutSnapshot.unreadReports = Math.max(
-      0,
-      Number(runtime.autoScoutSnapshot.unreadReports || 0) - markedRead
-    );
-    return markedRead;
-  }
-
-  async function processAutoScoutReports(reports, notes, includeExisting) {
-    const candidates = reports.filter((report) =>
-      includeExisting || !runtime.autoScoutProcessedReports[String(report.id)]
-    );
-    if (!candidates.length) return { processed: 0, favorites: 0, markedRead: 0 };
-
-    const latestBySystem = autoScoutLatestReportsBySystem(reports);
-    const affectedSystems = [...new Set(candidates.map((report) =>
-      Number((report.details && report.details.systemId) ?? report.systemId)
-    ).filter(Number.isFinite))];
-    let favorites = 0;
-
-    for (const systemId of affectedSystems) {
-      const tokens = autoScoutTokensForSystem(latestBySystem.get(systemId));
-      const result = await syncAutoScoutFavorite(systemId, tokens, notes);
-      if (result.changed) favorites += 1;
-      const timestamp = Date.now();
-      for (const report of candidates) {
-        const reportSystemId = Number(
-          (report.details && report.details.systemId) ?? report.systemId
-        );
-        if (reportSystemId === systemId) {
-          runtime.autoScoutProcessedReports[String(report.id)] = timestamp;
-        }
-      }
-    }
-
-    pruneAutoScoutProcessedReports();
-    const markedRead = await markAutoScoutReportsRead(candidates);
-    saveAutoScoutState();
-    return { processed: candidates.length, favorites, markedRead };
-  }
-
-  async function initializeAutoScoutReportBaseline(reports) {
-    if (GM_getValue(STORAGE.autoScoutReportBaselineReady, false)) return;
-    const timestamp = Date.now();
-    for (const report of reports) {
-      runtime.autoScoutProcessedReports[String(report.id)] = timestamp;
-    }
-    pruneAutoScoutProcessedReports();
-    GM_setValue(STORAGE.autoScoutReportBaselineReady, true);
-    saveAutoScoutState();
   }
 
   function autoScoutAvailableUnits(fleetData, catalogData, requiredShipKeys) {
@@ -2903,11 +2680,7 @@
     ];
     if (forWork) {
       if (mode === 'resource') {
-        workRequests.push(
-          apiJson('/api/galaxy/field-index'),
-          apiJson('/api/fleet/field-scan-reports'),
-          apiJson('/api/command-center/map-notes')
-        );
+        workRequests.push(apiJson('/api/galaxy/field-index'));
       } else {
         workRequests.push(
           apiJson('/api/fleet/survey-cooldowns'),
@@ -2919,8 +2692,6 @@
     const workResults = await Promise.all(workRequests);
     const fleetData = workResults[0];
     const fieldIndexData = forWork && mode === 'resource' ? workResults[1] : null;
-    const reportData = forWork && mode === 'resource' ? workResults[2] : null;
-    const noteData = forWork && mode === 'resource' ? workResults[3] : null;
     const cooldownData = forWork && mode === 'pirate' ? workResults[1] : null;
     const pirateData = forWork && mode === 'pirate' ? workResults[2] : null;
     const mapData = forWork && mode === 'pirate' ? workResults[3] : null;
@@ -2947,21 +2718,8 @@
       pirateBlockedSystems: 0,
       activeFieldIds: new Set()
     };
-    let unreadReports = 0;
 
     if (forWork && mode === 'resource') {
-      const reports = autoScoutReportRows(reportData);
-      const notes = autoScoutMapNoteRows(noteData);
-      unreadReports = reports.filter((report) => !report.isRead).length;
-      await initializeAutoScoutReportBaseline(reports);
-      try {
-        await processAutoScoutReports(reports, notes, false);
-        unreadReports = reports.filter((report) => !report.isRead).length;
-      } catch (error) {
-        runtime.autoScoutLastError = '報告整理：' + String(
-          error && error.message ? error.message : error
-        );
-      }
       candidateResult = autoScoutCandidateFields({ planet, missionData, fieldIndexData });
     } else if (forWork) {
       candidateResult = autoScoutCandidateSystems({
@@ -2987,7 +2745,6 @@
       freeFleetSlots,
       activeFieldScans: candidateResult.activeFieldIds.size,
       readyFields: mode === 'resource' ? candidateResult.targets.length : 0,
-      unreadReports,
       activeSurveys: candidateResult.activeSurveyIds.size,
       readySystems: mode === 'pirate' ? candidateResult.targets.length : 0,
       coolingSystems: candidateResult.coolingIds.size,
@@ -3005,8 +2762,6 @@
       pirateData,
       mapData,
       fieldIndexData,
-      reportData,
-      noteData,
       availableUnits,
       candidateResult,
       freeFleetSlots
@@ -3125,44 +2880,6 @@
     autoScoutSoon('mode-changed');
   }
 
-  function changeAutoScoutThreshold(event) {
-    runtime.autoScoutThreshold = normalizedAutoScoutThreshold(
-      event && event.target && event.target.value
-    );
-    if (runtime.autoScoutThresholdInput) {
-      runtime.autoScoutThresholdInput.value = String(runtime.autoScoutThreshold);
-    }
-    runtime.autoScoutLastAction =
-      '高倍率收藏門檻已改為 ' + autoScoutFormatRichness(runtime.autoScoutThreshold) + ' 倍';
-    saveAutoScoutState();
-    renderAutoScoutPanel();
-  }
-
-  async function organizeExistingAutoScoutReports() {
-    if (runtime.autoScoutPromise) return;
-    if (runtime.autoScoutReportButton) runtime.autoScoutReportButton.disabled = true;
-    try {
-      runtime.autoScoutLastError = '';
-      const [reportData, noteData] = await Promise.all([
-        apiJson('/api/fleet/field-scan-reports'),
-        apiJson('/api/command-center/map-notes')
-      ]);
-      const reports = autoScoutReportRows(reportData);
-      const notes = autoScoutMapNoteRows(noteData);
-      const result = await processAutoScoutReports(reports, notes, true);
-      runtime.autoScoutSnapshot.unreadReports = reports.filter((report) => !report.isRead).length;
-      runtime.autoScoutLastAction =
-        '已整理 ' + result.processed + ' 份礦氫報告；更新 ' +
-        result.favorites + ' 個收藏';
-    } catch (error) {
-      runtime.autoScoutLastError = String(error && error.message ? error.message : error);
-      runtime.autoScoutLastAction = '整理現有報告失敗';
-    } finally {
-      if (runtime.autoScoutReportButton) runtime.autoScoutReportButton.disabled = false;
-      renderAutoScoutPanel();
-    }
-  }
-
   function renderAutoScoutPanel() {
     const panel = runtime.autoScoutPanel;
     if (!panel || !panel.isConnected) return;
@@ -3174,11 +2891,6 @@
     const resourceMode = runtime.autoScoutMode === 'resource';
     if (runtime.autoScoutModeSelect) {
       runtime.autoScoutModeSelect.value = runtime.autoScoutMode;
-    }
-    if (runtime.autoScoutThresholdInput) {
-      runtime.autoScoutThresholdInput.value = String(runtime.autoScoutThreshold);
-      runtime.autoScoutThresholdInput.closest('[data-nexus-resource-controls]')
-        ?.style.setProperty('display', resourceMode ? 'grid' : 'none');
     }
     if (runtime.autoScoutToggleButton) {
       runtime.autoScoutToggleButton.textContent = runtime.autoScoutEnabled
@@ -3197,11 +2909,8 @@
           '｜艦隊空位：' + snapshot.freeFleetSlots + '/' + snapshot.maxFleetSlots +
           '｜本輪最多可派：' + snapshot.dispatchCapacity,
         '偵查中：' + snapshot.activeFieldScans +
-          '｜可偵查礦氫田：' + snapshot.readyFields +
-          '｜未讀報告：' + snapshot.unreadReports,
+          '｜可偵查礦氫田：' + snapshot.readyFields,
         '規則：只用 Probe／Spy Probe，每個礦場或氫氣田 1 艘；從家園嚴格由近到遠',
-        '收藏：倍率達 ' + autoScoutFormatRichness(runtime.autoScoutThreshold) +
-          ' 以上，自動標成「倍率礦／倍率氣」',
         '最近：' + runtime.autoScoutLastAction
       ] : [
         '狀態：' + (runtime.autoScoutEnabled ? '執行中' : '關閉（不會派船）'),
@@ -3240,7 +2949,6 @@
         '• 只使用 Probe／Spy Probe，每個礦場或氫氣田派 1 艘\n' +
         '• 派遣數自動取「可用船數」與「伺服器艦隊空位」較小值\n' +
         '• 每輪從家園嚴格由近到遠，不重複派往偵查中的資源田\n' +
-        '• 新報告會自動整理；達收藏門檻便標記倍率礦／倍率氣\n' +
         '• 啟用後在 Nexus Legacy 任一頁面都會持續執行\n\n' +
         '要啟用嗎？'
       : '啟用「海盜偵查」後：\n' +
@@ -3334,45 +3042,8 @@
       color: '#a9c7d2'
     });
     const actions = applyStyles(document.createElement('div'), {
-      display: 'grid',
-      gap: '7px'
+      display: 'grid'
     });
-    const resourceControls = applyStyles(document.createElement('div'), {
-      display: runtime.autoScoutMode === 'resource' ? 'grid' : 'none',
-      gridTemplateColumns: 'auto 70px 1fr',
-      alignItems: 'center',
-      gap: '6px'
-    });
-    resourceControls.dataset.nexusResourceControls = 'true';
-    const thresholdLabel = document.createElement('label');
-    thresholdLabel.textContent = '收藏門檻';
-    const thresholdInput = applyStyles(document.createElement('input'), {
-      width: '100%',
-      boxSizing: 'border-box',
-      border: '1px solid rgba(95, 210, 255, .48)',
-      borderRadius: '7px',
-      padding: '4px 6px',
-      background: '#0b2633',
-      color: '#e5f8ff'
-    });
-    thresholdInput.type = 'number';
-    thresholdInput.min = '0.1';
-    thresholdInput.max = '9.99';
-    thresholdInput.step = '0.1';
-    thresholdInput.value = String(runtime.autoScoutThreshold);
-    thresholdInput.addEventListener('change', changeAutoScoutThreshold);
-    const reportButton = applyStyles(document.createElement('button'), {
-      border: '1px solid rgba(95, 210, 255, .42)',
-      borderRadius: '7px',
-      padding: '5px 7px',
-      background: 'rgba(28, 73, 94, .72)',
-      color: '#e5f8ff',
-      cursor: 'pointer'
-    });
-    reportButton.type = 'button';
-    reportButton.textContent = '整理現有報告';
-    reportButton.addEventListener('click', organizeExistingAutoScoutReports);
-    resourceControls.append(thresholdLabel, thresholdInput, reportButton);
     const toggle = applyStyles(document.createElement('button'), {
       border: '1px solid rgba(98, 255, 203, .42)',
       borderRadius: '8px',
@@ -3382,7 +3053,7 @@
     });
     toggle.type = 'button';
     toggle.addEventListener('click', toggleAutoScout);
-    actions.append(resourceControls, toggle);
+    actions.append(toggle);
     panel.append(header, status, actions);
     document.body.appendChild(panel);
 
@@ -3390,8 +3061,6 @@
     runtime.autoScoutStatusNode = status;
     runtime.autoScoutToggleButton = toggle;
     runtime.autoScoutModeSelect = modeSelect;
-    runtime.autoScoutThresholdInput = thresholdInput;
-    runtime.autoScoutReportButton = reportButton;
     renderAutoScoutPanel();
     return panel;
   }
@@ -3596,7 +3265,6 @@
       autoScout: {
         enabled: runtime.autoScoutEnabled,
         mode: runtime.autoScoutMode,
-        threshold: runtime.autoScoutThreshold,
         snapshot: runtime.autoScoutSnapshot,
         nearestTargets: runtime.autoScoutPreviewTargets,
         lastAction: runtime.autoScoutLastAction,
