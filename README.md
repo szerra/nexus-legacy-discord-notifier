@@ -1,12 +1,12 @@
 # Nexus Legacy 精準 Discord 通知與星系自動偵查
 
-目前版本：`2.7.1`
+目前版本：`2.7.2`
 
 ## 安裝
 
 [點此安裝 Tampermonkey 使用者腳本](https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js)
 
-安裝後開啟 [Nexus Legacy](https://nl.luulyuan.cc/)，腳本會沿用原本儲存在 Tampermonkey 的 Apps Script `/exec` 網址與 `NEXUS_PLUGIN_SECRET`。原始碼不包含上述密鑰、Discord Webhook 或遊戲登入資料。
+安裝後可在 [原站](https://nl.luulyuan.cc/) 或 [RDP 站](http://rdp.luulyuan.cc:38212/) 使用。腳本會沿用原本儲存在 Tampermonkey 的 Apps Script `/exec` 網址與 `NEXUS_PLUGIN_SECRET`。原始碼不包含上述密鑰、Discord Webhook 或遊戲登入資料。
 
 ## 功能
 

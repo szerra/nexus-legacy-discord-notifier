@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Nexus Legacy 精準 Discord 完成通知
 // @namespace    https://nl.luulyuan.cc/
-// @version      2.7.1
+// @version      2.7.2
 // @description  追蹤艦隊、建築、研究與船艦製造完成時間，顯示海盜情報，並可切換自動偵查礦氫資源或海盜星系。
 // @updateURL    https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @match        https://nl.luulyuan.cc/*
+// @match        http://rdp.luulyuan.cc:38212/*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -20,7 +21,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Nexus Legacy 精準 Discord 完成通知';
-  const SCRIPT_VERSION = '2.7.1';
+  const SCRIPT_VERSION = '2.7.2';
   const DEFAULT_GAS_URL = '';
   const AUTH_STORAGE_KEY = 'galaxytest-auth';
   const ACTIVE_SYNC_MS = 30_000;
