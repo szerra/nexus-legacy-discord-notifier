@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nexus Legacy 精準 Discord 完成通知
 // @namespace    https://nl.luulyuan.cc/
-// @version      2.7.2
-// @description  追蹤艦隊、建築、研究與船艦製造完成時間，顯示海盜情報，並可切換自動偵查礦氫資源或海盜星系。
+// @version      2.8.0
+// @description  精準完成通知與佇列時間；可切換礦氫偵查、星系掃描及海盜營地兵力偵查。
 // @updateURL    https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @match        https://nl.luulyuan.cc/*
@@ -21,7 +21,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Nexus Legacy 精準 Discord 完成通知';
-  const SCRIPT_VERSION = '2.7.2';
+  const SCRIPT_VERSION = '2.8.0';
   const DEFAULT_GAS_URL = '';
   const AUTH_STORAGE_KEY = 'galaxytest-auth';
   const ACTIVE_SYNC_MS = 30_000;
@@ -38,7 +38,8 @@
     sent: 'nexus_line_sent_v1',
     // 使用新鍵，避免舊版礦氣偵查曾經啟用時，升級後立刻自行派船。
     autoScoutEnabled: 'nexus_auto_system_survey_enabled_v1',
-    autoScoutMode: 'nexus_auto_scout_mode_v1'
+    autoScoutMode: 'nexus_auto_scout_mode_v1',
+    campScoutDispatches: 'nexus_camp_scout_dispatches_v1'
   };
 
   const runtime = {
@@ -85,6 +86,12 @@
       dispatchCapacity: 0,
       availableResourceScouts: 0,
       availableStealthShips: 0,
+      availableCampScouts: 0,
+      availableSpyProbes: 0,
+      activeCampScouts: 0,
+      readyCamps: 0,
+      knownCamps: 0,
+      pendingCampDispatches: 0,
       freeFleetSlots: 0,
       activeFieldScans: 0,
       readyFields: 0,
@@ -238,9 +245,11 @@
       const detail = String(
         data && (data.message || data.error || data.code) || ''
       ).trim();
-      throw new Error(
+      const error = new Error(
         '遊戲 API ' + response.status + '：' + path + (detail ? '（' + detail + '）' : '')
       );
+      error.httpStatus = response.status;
+      throw error;
     }
 
     updateServerClock(data, startedAt, receivedAt);
@@ -2405,11 +2414,13 @@
   }
 
   function normalizedAutoScoutMode(value) {
-    return String(value || '') === 'resource' ? 'resource' : 'pirate';
+    return ['resource', 'camp'].includes(String(value)) ? String(value) : 'pirate';
   }
 
   function autoScoutModeLabel(mode = runtime.autoScoutMode) {
-    return normalizedAutoScoutMode(mode) === 'resource' ? '礦＋氫偵查' : '海盜偵查';
+    return { resource: '礦＋氫偵查', pirate: '星系掃描（找海盜）', camp: '營地兵力偵查' }[
+      normalizedAutoScoutMode(mode)
+    ];
   }
 
   function autoScoutCatalogRows(data) {
@@ -2487,6 +2498,97 @@
 
   function autoScoutAvailableResourceUnits(fleetData, catalogData) {
     return autoScoutAvailableUnits(fleetData, catalogData, ['probe', 'spy_probe']);
+  }
+
+  function autoScoutAvailableCampUnits(fleetData, catalogData) {
+    return autoScoutAvailableUnits(fleetData, catalogData, ['spy_probe', 'stealth_ship']);
+  }
+
+  function autoScoutMissionCampId(mission) {
+    // 現行遊戲使用 cargo.campId；不能用 targetSystemId 當營地識別。
+    return mission?.cargo?.campId ?? mission?.campId ?? mission?.targetCampId;
+  }
+
+  function autoScoutCampGuardKey(planetId, campId) {
+    return String(planetId) + ':' + String(campId);
+  }
+
+  function reconcileCampScoutDispatches(planet, missionData, pirateData) {
+    const guards = loadMap(STORAGE.campScoutDispatches);
+    const camps = apiArray(pirateData, 'camps');
+    const missions = autoScoutMissionRows(missionData);
+    const blockedCampIds = new Set();
+    for (const [key, guard] of Object.entries(guards)) {
+      if (String(guard.sourcePlanetId) !== String(planet.id)) continue;
+      const camp = camps.find((item) => String(item.id) === String(guard.campId));
+      const matching = missions.filter((mission) =>
+        mission.missionType === 'pirate_scout' &&
+        String(autoScoutMissionCampId(mission)) === String(guard.campId)
+      );
+      if (matching.some(autoScoutMissionIsActive)) {
+        guard.seenActive = true;
+      } else if (
+        (camp && (!autoScoutHasActivePirate(camp) || camp.hasFleetIntel === true)) ||
+        guard.seenActive ||
+        (camp && Number(camp.failedScoutAttempts) > Number(guard.failedScoutAttempts))
+      ) {
+        delete guards[key];
+        continue;
+      }
+      // 不以經過秒數猜測派遣是否成功；回應不明時保留，避免重送。
+      blockedCampIds.add(String(guard.campId));
+    }
+    saveMap(STORAGE.campScoutDispatches, guards);
+    return blockedCampIds;
+  }
+
+  function autoScoutCandidateCamps(snapshot) {
+    const activeCampIds = new Set();
+    const unresolvedSystemIds = new Set();
+    for (const mission of autoScoutMissionRows(snapshot.missionData)) {
+      if (mission?.missionType !== 'pirate_scout' || !autoScoutMissionIsActive(mission)) continue;
+      const campId = autoScoutMissionCampId(mission);
+      if (campId != null) activeCampIds.add(String(campId));
+      else if (mission.targetSystemId != null) unresolvedSystemIds.add(String(mission.targetSystemId));
+      else throw new Error('偵查任務缺少營地與星系識別，暫停派遣以避免重複');
+    }
+    const systems = new Map(autoScoutSystemRows(snapshot.mapData).map((system) => [String(system.id), system]));
+    const targets = [];
+    const seen = new Set();
+    let knownCamps = 0;
+    const homeX = Number(snapshot.planet.systemX);
+    const homeY = Number(snapshot.planet.systemY);
+    const pending = snapshot.pendingCampIds || new Set();
+    for (const camp of apiArray(snapshot.pirateData, 'camps')) {
+      if (!camp || camp.id == null || camp.systemId == null || seen.has(String(camp.id))) continue;
+      seen.add(String(camp.id));
+      if (!autoScoutHasActivePirate(camp)) continue;
+      if (Date.parse(camp.expiresAt || '') <= serverNowMs()) continue;
+      if (camp.hasFleetIntel === true) { knownCamps += 1; continue; }
+      if (activeCampIds.has(String(camp.id)) || pending.has(String(camp.id)) ||
+          unresolvedSystemIds.has(String(camp.systemId))) continue;
+      const system = systems.get(String(camp.systemId));
+      if (!system || (system.visibility && system.visibility !== 'full')) continue;
+      const systemX = Number(system.x ?? system.systemX);
+      const systemY = Number(system.y ?? system.systemY);
+      if (![snapshot.planet.systemX, snapshot.planet.systemY, system.x ?? system.systemX,
+        system.y ?? system.systemY].every((value) => value != null && value !== '')) continue;
+      if (![homeX, homeY, systemX, systemY].every(Number.isFinite)) continue;
+      targets.push({
+        campId: camp.id,
+        campName: String(camp.name || camp.id),
+        systemId: camp.systemId,
+        systemName: String(camp.systemName || system.name || camp.systemId),
+        failedScoutAttempts: Number(camp.failedScoutAttempts) || 0,
+        distance: Math.hypot(systemX - homeX, systemY - homeY)
+      });
+    }
+    targets.sort((left, right) => left.distance - right.distance ||
+      left.systemName.localeCompare(right.systemName, 'zh-Hant') ||
+      left.campName.localeCompare(right.campName, 'zh-Hant') ||
+      String(left.campId).localeCompare(String(right.campId)));
+    return { targets, activeCampIds, knownCamps, pendingCampDispatches: pending.size,
+      activeFieldIds: new Set(), activeSurveyIds: new Set(), coolingIds: new Set(), pirateBlockedSystems: 0 };
   }
 
   function autoScoutMissionIsActive(mission) {
@@ -2682,6 +2784,8 @@
     if (forWork) {
       if (mode === 'resource') {
         workRequests.push(apiJson('/api/galaxy/field-index'));
+      } else if (mode === 'camp') {
+        workRequests.push(apiJson('/api/fleet/pirate-camps'), apiJson('/api/galaxy/map'));
       } else {
         workRequests.push(
           apiJson('/api/fleet/survey-cooldowns'),
@@ -2694,8 +2798,8 @@
     const fleetData = workResults[0];
     const fieldIndexData = forWork && mode === 'resource' ? workResults[1] : null;
     const cooldownData = forWork && mode === 'pirate' ? workResults[1] : null;
-    const pirateData = forWork && mode === 'pirate' ? workResults[2] : null;
-    const mapData = forWork && mode === 'pirate' ? workResults[3] : null;
+    const pirateData = forWork ? (mode === 'camp' ? workResults[1] : mode === 'pirate' ? workResults[2] : null) : null;
+    const mapData = forWork ? (mode === 'camp' ? workResults[2] : mode === 'pirate' ? workResults[3] : null) : null;
     const missions = autoScoutMissionRows(missionData);
     const maxFleetSlots = Math.max(0, Number(
       missionData && (
@@ -2711,6 +2815,7 @@
     ).length;
     const availableResourceUnits = autoScoutAvailableResourceUnits(fleetData, catalogData);
     const availableStealthUnits = autoScoutAvailableStealthUnits(fleetData, catalogData);
+    const availableCampUnits = autoScoutAvailableCampUnits(fleetData, catalogData);
     const freeFleetSlots = Math.max(0, maxFleetSlots - usedFleetSlots);
     let candidateResult = {
       targets: [],
@@ -2722,6 +2827,10 @@
 
     if (forWork && mode === 'resource') {
       candidateResult = autoScoutCandidateFields({ planet, missionData, fieldIndexData });
+    } else if (forWork && mode === 'camp') {
+      const pendingCampIds = reconcileCampScoutDispatches(planet, missionData, pirateData);
+      candidateResult = autoScoutCandidateCamps({ planet, missionData, pirateData, mapData, pendingCampIds });
+      runtime.pirateCamps = apiArray(pirateData, 'camps');
     } else if (forWork) {
       candidateResult = autoScoutCandidateSystems({
         planet,
@@ -2733,7 +2842,8 @@
       runtime.pirateCamps = apiArray(pirateData, 'camps');
     }
 
-    const availableUnits = mode === 'resource' ? availableResourceUnits : availableStealthUnits;
+    const availableUnits = mode === 'resource' ? availableResourceUnits :
+      mode === 'camp' ? availableCampUnits : availableStealthUnits;
     runtime.autoScoutPreviewTargets = candidateResult.targets.slice(0, 20);
 
     runtime.autoScoutSnapshot = {
@@ -2743,6 +2853,12 @@
       dispatchCapacity: Math.min(availableUnits.length, freeFleetSlots),
       availableResourceScouts: availableResourceUnits.length,
       availableStealthShips: availableStealthUnits.length,
+      availableCampScouts: availableCampUnits.length,
+      availableSpyProbes: availableCampUnits.filter((unit) => unit.shipKey === 'spy_probe').length,
+      activeCampScouts: candidateResult.activeCampIds?.size || 0,
+      readyCamps: mode === 'camp' ? candidateResult.targets.length : 0,
+      knownCamps: candidateResult.knownCamps || 0,
+      pendingCampDispatches: candidateResult.pendingCampDispatches || 0,
       freeFleetSlots,
       activeFieldScans: candidateResult.activeFieldIds.size,
       readyFields: mode === 'resource' ? candidateResult.targets.length : 0,
@@ -2770,6 +2886,7 @@
   }
 
   async function dispatchAutoScoutMissions(snapshot) {
+    if (snapshot.mode === 'camp') return dispatchAutoScoutCampMissions(snapshot);
     const dispatchLimit = Math.min(
       snapshot.availableUnits.length,
       snapshot.freeFleetSlots
@@ -2822,6 +2939,7 @@
             (snapshot.mode === 'resource' ? target.fieldName : target.systemName);
           break;
         }
+        if (!runtime.autoScoutEnabled || normalizedAutoScoutMode(runtime.autoScoutMode) !== snapshot.mode) break;
         await apiJsonRequest(
           snapshot.mode === 'resource' ? '/api/fleet/field-scan' : '/api/fleet/survey',
           {
@@ -2868,9 +2986,89 @@
     return { dispatched, candidates: snapshot.candidateResult.targets.length };
   }
 
+  async function dispatchAutoScoutCampMissions(initialSnapshot) {
+    const limit = Math.min(initialSnapshot.availableUnits.length, initialSnapshot.freeFleetSlots,
+      initialSnapshot.candidateResult.targets.length);
+    let dispatched = 0;
+    let snapshot = initialSnapshot;
+    let stopReason = '';
+    const names = [];
+    const sentCampIds = new Set();
+    for (let index = 0; index < limit; index += 1) {
+      let guardKey = null;
+      try {
+        // 每次派遣後重新取得船數、空位與情報，不用本地扣數當伺服器事實。
+        if (index > 0) snapshot = await loadAutoScoutSnapshot(true);
+        if (!runtime.autoScoutEnabled || runtime.autoScoutMode !== 'camp' || snapshot.mode !== 'camp') break;
+        const target = snapshot.candidateResult.targets.find((camp) => !sentCampIds.has(String(camp.campId)));
+        const unit = snapshot.availableUnits.find((ship) => ['spy_probe', 'stealth_ship'].includes(ship.shipKey));
+        if (!target || !unit || snapshot.freeFleetSlots < 1) break;
+        const ships = [{ shipDefId: unit.shipDefId, quantity: 1 }];
+        const estimate = await apiJsonRequest('/api/fleet/fuel-estimate', {
+          method: 'POST',
+          body: { sourcePlanetId: Number(snapshot.planet.id), targetSystemId: target.systemId,
+            missionType: 'pirate_scout', ships }
+        });
+        const fuel = estimate?.data || estimate;
+        if (fuel?.fleetAvailable === false) {
+          stopReason = '伺服器判定偵查船不可用，等待重新讀取船數';
+          break;
+        }
+        if (!fuel || fuel.sufficient !== true) {
+          stopReason = fuel?.sufficient === false ? '氫氣不足，暫停派遣' : '燃料預估未確認，暫停派遣';
+          break;
+        }
+        // 使用者可能在燃料預估等待期間停止或切換模式。
+        if (!runtime.autoScoutEnabled || runtime.autoScoutMode !== 'camp') break;
+        const guards = loadMap(STORAGE.campScoutDispatches);
+        guardKey = autoScoutCampGuardKey(snapshot.planet.id, target.campId);
+        if (guards[guardKey]) continue;
+        guards[guardKey] = { sourcePlanetId: snapshot.planet.id, campId: target.campId,
+          failedScoutAttempts: target.failedScoutAttempts, seenActive: false };
+        saveMap(STORAGE.campScoutDispatches, guards);
+        await apiJsonRequest('/api/fleet/scout-camp', {
+          method: 'POST',
+          body: { sourcePlanetId: Number(snapshot.planet.id), campId: target.campId, ships }
+        });
+        sentCampIds.add(String(target.campId));
+        names.push(target.campName);
+        dispatched += 1;
+      } catch (error) {
+        // 明確 4xx 拒絕可以解除本次保留；逾時/斷線/5xx 不猜測失敗、不重送。
+        if (guardKey && error.httpStatus >= 400 && error.httpStatus < 500 && error.httpStatus !== 408) {
+          const guards = loadMap(STORAGE.campScoutDispatches);
+          delete guards[guardKey];
+          saveMap(STORAGE.campScoutDispatches, guards);
+        }
+        runtime.autoScoutEnabled = false;
+        saveAutoScoutState();
+        runtime.autoScoutLastError = String(error?.message || error);
+        stopReason = '已停止自動偵查，請檢查艦隊任務後再啟用；未確認的營地不會自動重送';
+        break;
+      }
+    }
+    if (!stopReason && !dispatched) {
+      stopReason = !initialSnapshot.availableUnits.length ? '目前沒有可派遣的間諜探測器或隱形艦' :
+        initialSnapshot.freeFleetSlots < 1 ? '目前沒有可用艦隊空位' :
+          '目前沒有待偵查的營地；等待任務完成或新營地出現';
+    }
+    // 最後一次派遣後也讀回即時船數與空位。失敗只顯示，不能重送派遣。
+    if (dispatched) {
+      try { await loadAutoScoutSnapshot(runtime.autoScoutMode === 'camp'); }
+      catch (error) { runtime.autoScoutLastError = String(error?.message || error); }
+    }
+    runtime.autoScoutLastAction = [
+      dispatched ? '已派出 ' + dispatched + ' 艘：' + names.slice(0, 4).join('、') + (names.length > 4 ? '…' : '') : '',
+      stopReason
+    ].filter(Boolean).join('；');
+    return { dispatched, candidates: initialSnapshot.candidateResult.targets.length };
+  }
+
   function changeAutoScoutMode(event) {
     const nextMode = normalizedAutoScoutMode(event && event.target && event.target.value);
     if (nextMode === runtime.autoScoutMode) return;
+    // 改變任務種類必須重新啟用，不能因舊模式仍開啟而直接派出新任務。
+    runtime.autoScoutEnabled = false;
     runtime.autoScoutMode = nextMode;
     runtime.autoScoutLastError = '';
     runtime.autoScoutLastAction = runtime.autoScoutEnabled
@@ -2890,6 +3088,7 @@
 
     const snapshot = runtime.autoScoutSnapshot;
     const resourceMode = runtime.autoScoutMode === 'resource';
+    const campMode = runtime.autoScoutMode === 'camp';
     if (runtime.autoScoutModeSelect) {
       runtime.autoScoutModeSelect.value = runtime.autoScoutMode;
     }
@@ -2912,6 +3111,18 @@
         '偵查中：' + snapshot.activeFieldScans +
           '｜可偵查礦氫田：' + snapshot.readyFields,
         '規則：只用 Probe／Spy Probe，每個礦場或氫氣田 1 艘；從家園嚴格由近到遠',
+        '最近：' + runtime.autoScoutLastAction
+      ] : campMode ? [
+        '模式：營地兵力偵查｜狀態：' + (runtime.autoScoutEnabled ? '執行中' : '關閉（不會派船）'),
+        '可用間諜：' + snapshot.availableSpyProbes + '｜隱形艦：' + snapshot.availableStealthShips,
+        '艦隊空位：' + snapshot.freeFleetSlots + '/' + snapshot.maxFleetSlots +
+          '｜船數／空位上限：' + snapshot.dispatchCapacity,
+        '偵查中：' + snapshot.activeCampScouts + '｜待偵查營地：' + snapshot.readyCamps +
+          '｜完整情報：' + snapshot.knownCamps,
+        '派遣追蹤：' + snapshot.pendingCampDispatches + '（回應不明不重送）',
+        '規則：只用間諜探測器／隱形艦，每營地 1 艘；家園由近到遠',
+        '同星系多營地分開偵查；完整情報跳過；部分情報返航後再偵查',
+        '觀測艦伴航由遊戲自動配置；偵查可能失敗或損失艦船',
         '最近：' + runtime.autoScoutLastAction
       ] : [
         '狀態：' + (runtime.autoScoutEnabled ? '執行中' : '關閉（不會派船）'),
@@ -2945,6 +3156,7 @@
     }
 
     const resourceMode = runtime.autoScoutMode === 'resource';
+    const campMode = runtime.autoScoutMode === 'camp';
     const confirmed = unsafeWindow.confirm(resourceMode
       ? '啟用「礦＋氫偵查」後：\n' +
         '• 只使用 Probe／Spy Probe，每個礦場或氫氣田派 1 艘\n' +
@@ -2952,7 +3164,15 @@
         '• 每輪從家園嚴格由近到遠，不重複派往偵查中的資源田\n' +
         '• 啟用後在 Nexus Legacy 任一頁面都會持續執行\n\n' +
         '要啟用嗎？'
-      : '啟用「海盜偵查」後：\n' +
+      : campMode ? '啟用「營地兵力偵查」後：\n' +
+        '• 只使用間諜探測器／隱形艦，每個海盜營地派 1 艘\n' +
+        '• 自動讀取家園可用船數、艦隊空位，每輪由近到遠\n' +
+        '• 同星系多營地各自處理；已知完整兵力或偵查中的營地跳過\n' +
+        '• 部分情報在任務完成後會再次偵查，直到取得完整情報\n' +
+        '• 偵查會消耗氫氣，可能失敗或損失艦船\n' +
+        '• 觀測艦伴航由遊戲自動配置，插件不指定額外伴航船\n' +
+        '• 只在一個遊戲分頁啟用自動偵查，避免多分頁同時派遣\n\n要啟用嗎？'
+      : '啟用「星系掃描（找海盜）」後：\n' +
         '• 只使用隱形艦（Stealth Ship），每個星系派 1 艘\n' +
         '• 派遣數自動取「可用船數」與「伺服器艦隊空位」較小值\n' +
         '• 每次都從家園重新計算，嚴格由近到遠\n' +
@@ -2968,7 +3188,8 @@
       runtime.autoScoutLastError = '';
       runtime.autoScoutLastAction = runtime.autoScoutMode === 'resource'
         ? '已啟用，正在尋找家園附近未偵查的礦場與氫氣田'
-        : '已啟用，正在尋找家園附近可重新掃描的星系';
+        : runtime.autoScoutMode === 'camp' ? '已啟用，正在尋找家園附近缺少完整兵力情報的營地'
+          : '已啟用，正在尋找家園附近可重新掃描的星系';
       saveAutoScoutState();
       renderAutoScoutPanel();
       autoScoutSoon('enabled');
@@ -3026,7 +3247,8 @@
     modeSelect.setAttribute('aria-label', '自動偵查模式');
     for (const [value, label] of [
       ['resource', '礦＋氫偵查'],
-      ['pirate', '海盜偵查']
+      ['pirate', '星系掃描（找海盜）'],
+      ['camp', '營地兵力偵查']
     ]) {
       const option = document.createElement('option');
       option.value = value;
@@ -3092,7 +3314,8 @@
         } else if (reason === 'startup' || reason === 'visible') {
           runtime.autoScoutLastAction = runtime.autoScoutMode === 'resource'
             ? '關閉中；只讀取資源偵查船與艦隊空位'
-            : '關閉中；只讀取隱形艦與艦隊空位';
+            : runtime.autoScoutMode === 'camp' ? '關閉中；只讀取間諜、隱形艦與艦隊空位'
+              : '關閉中；只讀取隱形艦與艦隊空位';
         }
       } catch (error) {
         runtime.autoScoutLastError = String(error && error.message ? error.message : error);
@@ -3130,7 +3353,8 @@
       '可用偵查船／艦隊空位／本輪可派：' +
         (runtime.autoScoutMode === 'resource'
           ? runtime.autoScoutSnapshot.availableResourceScouts
-          : runtime.autoScoutSnapshot.availableStealthShips) + '／' +
+          : runtime.autoScoutMode === 'camp' ? runtime.autoScoutSnapshot.availableCampScouts
+            : runtime.autoScoutSnapshot.availableStealthShips) + '／' +
         runtime.autoScoutSnapshot.freeFleetSlots + '／' +
         runtime.autoScoutSnapshot.dispatchCapacity,
       '等待送 Discord：' + Object.keys(runtime.pending).length,
