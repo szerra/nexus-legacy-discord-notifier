@@ -204,7 +204,7 @@ test('render third option and counts; mode switch stops running work', async () 
   const h = server();
   await h.api.loadAutoScoutSnapshot(true);
   const panel = h.api.ensureAutoScoutPanel();
-  assert.equal(panel.dataset.nexusVersion, '2.8.0');
+  assert.equal(panel.dataset.nexusVersion, '2.8.1');
   assert.deepEqual(Array.from(h.api.runtime.autoScoutModeSelect.children, x => x.value), ['resource', 'pirate', 'camp']);
   const text = h.api.runtime.autoScoutStatusNode.children.map(x => x.textContent).join('\n');
   assert.match(text, /可用間諜：1｜隱形艦：1/);
@@ -222,7 +222,25 @@ test('resource and survey candidate behavior remains intact', () => {
   assert.equal(fields.targets.length, 2);
   const survey = api.autoScoutCandidateSystems({ planet, mapData, missionData: { missions: [] },
     cooldownData: { availableSystemIds: [20, 30], cooldowns: [] }, pirateData: { camps: [camp(1)] } });
-  assert.deepEqual(Array.from(survey.targets, s => s.systemId), [30]);
+  assert.deepEqual(Array.from(survey.targets, s => s.systemId), [20, 30]);
+});
+test('survey respects server availability, cooldown and active scans even when camps exist', () => {
+  const { api } = harness();
+  const snapshot = { planet, mapData, missionData: { missions: [] },
+    cooldownData: { availableSystemIds: [20, 30], cooldowns: [] },
+    pirateData: { camps: [camp(1), camp(2, { systemId: 30 })] } };
+  const ids = () => Array.from(api.autoScoutCandidateSystems(snapshot).targets, s => s.systemId);
+  assert.deepEqual(ids(), [20, 30]);
+  snapshot.cooldownData.availableSystemIds = [30];
+  assert.deepEqual(ids(), [30]);
+  snapshot.cooldownData.availableSystemIds = [20, 30];
+  snapshot.cooldownData.cooldowns = [{ systemId: 20, cooldownEndsAt: '2999-01-01T00:00:00Z' }];
+  assert.deepEqual(ids(), [30]);
+  snapshot.cooldownData.cooldowns = [{ systemId: 20, cooldownEndsAt: '2000-01-01T00:00:00Z' }];
+  snapshot.missionData.missions = [{ missionType: 'survey', status: 'returning', targetSystemId: 30 }];
+  assert.deepEqual(ids(), [20]);
+  snapshot.missionData.missions[0].status = 'completed';
+  assert.deepEqual(ids(), [20, 30]);
 });
 for (const mode of ['resource', 'pirate']) test(`${mode} retains its dispatch endpoint and stops after mode switch`, async () => {
   const h = harness();

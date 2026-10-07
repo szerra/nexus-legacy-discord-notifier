@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nexus Legacy 精準 Discord 完成通知
 // @namespace    https://nl.luulyuan.cc/
-// @version      2.8.0
+// @version      2.8.1
 // @description  精準完成通知與佇列時間；可切換礦氫偵查、星系掃描及海盜營地兵力偵查。
 // @updateURL    https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
 // @downloadURL  https://raw.githubusercontent.com/szerra/nexus-legacy-discord-notifier/main/NexusLegacy_Exact_Discord_Notifications_v2.0.0.user.js
@@ -21,7 +21,7 @@
   'use strict';
 
   const SCRIPT_NAME = 'Nexus Legacy 精準 Discord 完成通知';
-  const SCRIPT_VERSION = '2.8.0';
+  const SCRIPT_VERSION = '2.8.1';
   const DEFAULT_GAS_URL = '';
   const AUTH_STORAGE_KEY = 'galaxytest-auth';
   const ACTIVE_SYNC_MS = 30_000;
@@ -97,8 +97,7 @@
       readyFields: 0,
       activeSurveys: 0,
       readySystems: 0,
-      coolingSystems: 0,
-      pirateBlockedSystems: 0
+      coolingSystems: 0
     },
     autoScoutLastAction: '尚未執行',
     autoScoutLastError: ''
@@ -2588,7 +2587,7 @@
       left.campName.localeCompare(right.campName, 'zh-Hant') ||
       String(left.campId).localeCompare(String(right.campId)));
     return { targets, activeCampIds, knownCamps, pendingCampDispatches: pending.size,
-      activeFieldIds: new Set(), activeSurveyIds: new Set(), coolingIds: new Set(), pirateBlockedSystems: 0 };
+      activeFieldIds: new Set(), activeSurveyIds: new Set(), coolingIds: new Set() };
   }
 
   function autoScoutMissionIsActive(mission) {
@@ -2680,8 +2679,7 @@
       targets,
       activeFieldIds,
       activeSurveyIds: new Set(),
-      coolingIds: new Set(),
-      pirateBlockedSystems: 0
+      coolingIds: new Set()
     };
   }
 
@@ -2705,11 +2703,6 @@
         .filter((entry) => Date.parse(entry && entry.cooldownEndsAt || '') > now)
         .map((entry) => String(entry.systemId))
     );
-    const pirateIds = new Set(
-      apiArray(snapshot.pirateData, 'camps')
-        .filter(autoScoutHasActivePirate)
-        .map((camp) => String(camp.systemId))
-    );
     const activeSurveyIds = new Set(
       autoScoutMissionRows(snapshot.missionData)
         .filter((mission) =>
@@ -2724,7 +2717,6 @@
     const homeY = Number(snapshot.planet.systemY);
     const targets = [];
     const seen = new Set();
-    let pirateBlockedSystems = 0;
 
     for (const system of autoScoutSystemRows(snapshot.mapData)) {
       const systemId = String(system && system.id);
@@ -2733,10 +2725,6 @@
       if (!availableIds.has(systemId)) continue;
       if (system.visibility && String(system.visibility) !== 'full') continue;
       if (coolingIds.has(systemId) || activeSurveyIds.has(systemId)) continue;
-      if (pirateIds.has(systemId)) {
-        pirateBlockedSystems += 1;
-        continue;
-      }
       const systemX = Number(system.x ?? system.systemX);
       const systemY = Number(system.y ?? system.systemY);
       if (![homeX, homeY, systemX, systemY].every(Number.isFinite)) continue;
@@ -2757,9 +2745,7 @@
       targets,
       activeFieldIds: new Set(),
       activeSurveyIds,
-      coolingIds,
-      pirateIds,
-      pirateBlockedSystems
+      coolingIds
     };
   }
 
@@ -2821,7 +2807,6 @@
       targets: [],
       activeSurveyIds: new Set(),
       coolingIds: new Set(),
-      pirateBlockedSystems: 0,
       activeFieldIds: new Set()
     };
 
@@ -2864,8 +2849,7 @@
       readyFields: mode === 'resource' ? candidateResult.targets.length : 0,
       activeSurveys: candidateResult.activeSurveyIds.size,
       readySystems: mode === 'pirate' ? candidateResult.targets.length : 0,
-      coolingSystems: candidateResult.coolingIds.size,
-      pirateBlockedSystems: candidateResult.pirateBlockedSystems
+      coolingSystems: candidateResult.coolingIds.size
     };
 
     return {
@@ -2904,7 +2888,7 @@
     if (!targets.length) {
       runtime.autoScoutLastAction = snapshot.mode === 'resource'
         ? '目前沒有尚未偵查的礦場或氫氣田'
-        : '目前沒有冷卻完畢且無海盜的可掃描星系';
+        : '目前沒有冷卻完畢且尚無掃描任務的可掃描星系';
       return { dispatched: 0, candidates: 0 };
     }
 
@@ -3131,10 +3115,9 @@
           '｜本輪最多可派：' + snapshot.dispatchCapacity,
         '掃描中：' + snapshot.activeSurveys,
         '可掃描：' + snapshot.readySystems +
-          '｜冷卻中：' + snapshot.coolingSystems +
-          '｜有海盜暫停：' + snapshot.pirateBlockedSystems,
+          '｜冷卻中：' + snapshot.coolingSystems,
         '規則：只用 Stealth Ship，每星系 1 艘；從家園嚴格由近到遠',
-        '循環：冷卻完再掃；發現海盜先跳過，消滅後恢復掃描',
+        '循環：CD 到且伺服器允許就再掃；星系已有海盜也可掃描',
         '最近：' + runtime.autoScoutLastAction
       ];
       if (runtime.autoScoutLastError) lines.push('錯誤：' + runtime.autoScoutLastError);
@@ -3177,7 +3160,7 @@
         '• 派遣數自動取「可用船數」與「伺服器艦隊空位」較小值\n' +
         '• 每次都從家園重新計算，嚴格由近到遠\n' +
         '• 只掃描伺服器判定已冷卻完畢的星系\n' +
-        '• 星系有存活海盜時跳過；消滅海盜後恢復循環\n' +
+        '• 星系已有海盜仍可掃描；正在掃描的星系不重複派遣\n' +
         '• 啟用後在 Nexus Legacy 任一頁面都會持續執行\n\n' +
         '要啟用嗎？'
     );
